@@ -4,9 +4,11 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import os
+from market_data import fetch_eodhd, provider_status
 
-st.set_page_config(page_title="Trading Analyzer Pro V2", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Trading Analyzer Pro V3", page_icon="📈", layout="wide")
 st.markdown("""
 <style>
 .block-container {padding-top:1.1rem; padding-bottom:2rem; max-width:1600px;}
@@ -15,7 +17,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-VERSION = "3.0"
+VERSION = "3.1"
 PRESETS = {
     "Actions": {"Apple":"AAPL","Nvidia":"NVDA","Microsoft":"MSFT","TotalEnergies":"TTE.PA","Airbus":"AIR.PA"},
     "Indices": {"Nasdaq 100":"^NDX","S&P 500":"^GSPC","CAC 40":"^FCHI","DAX":"^GDAXI","Dow Jones":"^DJI"},
@@ -32,36 +34,49 @@ TF_CONFIG = {
     "Hebdomadaire": ("5y","1wk"),
 }
 TF_ORDER = ["5 min","15 min","1 heure","4 heures","Journalier","Hebdomadaire"]
+TRADING_STYLES = {
+    "Scalping": {"timeframes": ["5 min", "15 min"], "description": "Très court terme : nécessite des données fraîches, un spread faible et une exécution rapide.", "risk_note": "Le flux REST historique seul ne suffit pas pour du scalping en réel."},
+    "Day trading": {"timeframes": ["5 min", "15 min", "1 heure"], "description": "Positions ouvertes et clôturées dans la même séance.", "risk_note": "Vérifier horaires de marché, spread et annonces économiques."},
+    "Swing trading": {"timeframes": ["4 heures", "Journalier", "Hebdomadaire"], "description": "Positions conservées plusieurs jours ou semaines.", "risk_note": "Confirmer les signaux à la clôture de la bougie."},
+}
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_data(ticker, period, interval):
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_yahoo_data(ticker, period, interval):
     try:
-        raw = yf.download(ticker, period=period, interval=interval, auto_adjust=True,
-                          progress=False, threads=False)
-        if raw is None or raw.empty:
-            return pd.DataFrame()
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        raw.columns = [str(c).lower().replace(" ","_") for c in raw.columns]
-        cols = ["open","high","low","close","volume"]
-        if not all(c in raw.columns for c in cols):
-            return pd.DataFrame()
-        out = raw[cols].copy().dropna(subset=["open","high","low","close"])
+        raw = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
+        if raw is None or raw.empty: return pd.DataFrame()
+        if isinstance(raw.columns, pd.MultiIndex): raw.columns = raw.columns.get_level_values(0)
+        raw.columns = [str(c).lower().replace(" ", "_") for c in raw.columns]
+        cols = ["open", "high", "low", "close", "volume"]
+        if not all(c in raw.columns for c in cols): return pd.DataFrame()
+        out = raw[cols].copy().dropna(subset=["open", "high", "low", "close"])
         out.index = pd.to_datetime(out.index)
-        if getattr(out.index, "tz", None) is not None:
-            out.index = out.index.tz_localize(None)
+        if getattr(out.index, "tz", None) is not None: out.index = out.index.tz_convert("UTC").tz_localize(None)
         return out
-    except Exception:
-        return pd.DataFrame()
+    except Exception: return pd.DataFrame()
 
-def get_tf_data(ticker, tf):
+def fetch_data(ticker, period, interval, provider="Yahoo Finance", asset_class="Actions"):
+    if provider == "EODHD": return fetch_eodhd(ticker, period, interval, asset_class)
+    return fetch_yahoo_data(ticker, period, interval)
+
+def get_tf_data(ticker, tf, provider="Yahoo Finance", asset_class="Actions"):
     period, interval = TF_CONFIG[tf]
-    df = fetch_data(ticker, period, interval)
+    if provider == "EODHD":
+        if tf == "5 min": return fetch_data(ticker, "5d", "5m", provider, asset_class)
+        if tf == "15 min":
+            base = fetch_data(ticker, "5d", "5m", provider, asset_class)
+            return base.resample("15min", origin="start_day").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna() if not base.empty else base
+        if tf == "1 heure": return fetch_data(ticker, "3mo", "1h", provider, asset_class)
+        if tf == "4 heures":
+            base = fetch_data(ticker, "6mo", "1h", provider, asset_class)
+            return base.resample("4h", origin="start_day").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna() if not base.empty else base
+        if tf == "Journalier": return fetch_data(ticker, "2y", "1d", provider, asset_class)
+        base = fetch_data(ticker, "5y", "1d", provider, asset_class)
+        return base.resample("W-FRI").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna() if not base.empty else base
+    df = fetch_data(ticker, period, interval, provider, asset_class)
     if tf == "4 heures" and not df.empty:
-        # Resampling is approximate and depends on Yahoo's hourly timestamps.
-        df = df.resample("4h").agg({
-            "open":"first","high":"max","low":"min","close":"last","volume":"sum"
-        }).dropna(subset=["open","high","low","close"])
+        df = df.resample("4h").agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"}).dropna()
     return df
 
 def indicators(df):
@@ -231,12 +246,12 @@ SCAN_UNIVERSE = {
     }
 }
 
-def scan_one_asset(name, symbol, tf_list):
+def scan_one_asset(name, symbol, tf_list, provider="Yahoo Finance", asset_class="Actions"):
     """Analyse technique indicative d'un actif sur les unités choisies."""
     rows = []
     usable = []
     for tf in tf_list:
-        raw = get_tf_data(symbol, tf)
+        raw = get_tf_data(symbol, tf, provider, asset_class)
         if raw.empty or len(raw) < 55:
             continue
         d = indicators(raw)
@@ -313,13 +328,18 @@ def scan_one_asset(name, symbol, tf_list):
 
 
 st.title("📈 Trading Analyzer Pro")
-st.caption("Version 3.0 • Analyse multi-unités, scanner d’opportunités multi-marchés, gestion du risque et backtesting pédagogique • Données Yahoo Finance")
+st.caption("V3.1 • Profils scalping / day trading / swing • Fournisseur EODHD ou Yahoo Finance")
+st.caption("Version 3.1 • Analyse multi-unités, scanner multi-marchés, gestion du risque et backtesting pédagogique")
 
 with st.sidebar:
     st.header("Marché")
     category=st.selectbox("Catégorie",list(PRESETS))
+    data_provider = st.selectbox("Fournisseur de données", ["Yahoo Finance", "EODHD"], index=0)
+    if data_provider == "EODHD": st.caption("EODHD nécessite une clé API et un symbole pris en charge.")
+    trading_style = st.selectbox("Style de trading", list(TRADING_STYLES), index=2)
+    st.caption(TRADING_STYLES[trading_style]["description"])
     instrument=st.selectbox("Instrument",list(PRESETS[category]))
-    ticker=st.text_input("Ticker Yahoo Finance",value=PRESETS[category][instrument]).strip().upper()
+    ticker=st.text_input("Ticker / symbole",value=PRESETS[category][instrument]).strip().upper()
     st.divider()
     st.subheader("Unités de temps")
     selected_tfs=st.multiselect("Unités à comparer",TF_ORDER,default=TF_ORDER)
@@ -332,11 +352,12 @@ if not ticker:
     st.error("Saisis un ticker valide."); st.stop()
 if not selected_tfs:
     st.warning("Sélectionne au moins une unité de temps."); st.stop()
+if data_provider == "EODHD": st.caption(provider_status())
 
 frames={}
 with st.spinner(f"Chargement des unités de temps de {ticker}…"):
     for tf in selected_tfs:
-        raw=get_tf_data(ticker,tf)
+        raw=get_tf_data(ticker,tf,data_provider,category)
         if not raw.empty: frames[tf]=indicators(raw)
 
 if chart_tf not in frames:
@@ -381,7 +402,7 @@ with tab1:
     fig.update_layout(height=680,template="plotly_dark",xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10),legend=dict(orientation="h"))
     fig.update_yaxes(title_text="Prix",row=1,col=1); fig.update_yaxes(title_text="Volume",row=2,col=1)
     st.plotly_chart(fig,use_container_width=True)
-    st.caption(f"{len(df)} bougies • Dernière bougie : {df.index[-1]} • Unité : {chart_tf}")
+    st.caption(f"{len(df)} bougies • Dernière bougie : {df.index[-1]} UTC • Unité : {chart_tf} • Source : {data_provider}")
     st.write("Figures de la dernière bougie :",", ".join(patterns) if patterns else "Aucune figure simple détectée.")
 
 with tab2:
@@ -516,10 +537,9 @@ with tab6:
         "Marchés à analyser", list(SCAN_UNIVERSE.keys()),
         default=list(SCAN_UNIVERSE.keys())
     )
-    scan_tfs = c2.multiselect(
-        "Unités à scanner", TF_ORDER,
-        default=["1 heure", "4 heures", "Journalier", "Hebdomadaire"]
-    )
+    scan_style = c2.selectbox("Style à privilégier", list(TRADING_STYLES), index=list(TRADING_STYLES).index(trading_style))
+    scan_tfs = st.multiselect("Unités à scanner (toutes sélectionnables)", TF_ORDER, default=TRADING_STYLES[scan_style]["timeframes"])
+    st.caption(TRADING_STYLES[scan_style]["risk_note"])
     min_score = c3.slider("Score minimum", 0, 100, 55, 5)
     st.caption("Pour limiter les appels de données, commence avec 1 h, 4 h, journalier et hebdomadaire. Le scan des 6 unités est possible mais plus lent.")
     run_scan = st.button("🔍 Lancer le scan de marché", type="primary", use_container_width=True)
@@ -533,7 +553,7 @@ with tab6:
             progress = st.progress(0, text="Préparation du scan…")
             for idx, (cat, nm, sym) in enumerate(assets, start=1):
                 try:
-                    found = scan_one_asset(nm, sym, scan_tfs)
+                    found = scan_one_asset(nm, sym, scan_tfs, data_provider, cat)
                     for row in found:
                         row["Marché"] = cat
                         scan_rows.append(row)
