@@ -4,372 +4,391 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timezone
+from datetime import datetime
 
-st.set_page_config(page_title="Trading Analyzer Pro", page_icon="📈", layout="wide")
-
+st.set_page_config(page_title="Trading Analyzer Pro V2", page_icon="📈", layout="wide")
 st.markdown("""
 <style>
-.block-container {padding-top: 1.4rem; padding-bottom: 2rem; max-width: 1500px;}
-[data-testid="stMetric"] {background: rgba(120,120,120,.07); padding: 12px; border-radius: 10px;}
-.small-note {font-size: .86rem; opacity: .78;}
+.block-container {padding-top:1.1rem; padding-bottom:2rem; max-width:1600px;}
+[data-testid="stMetric"] {background:rgba(120,120,120,.07);padding:10px;border-radius:10px;}
+.small-note {font-size:.85rem;opacity:.8}
 </style>
 """, unsafe_allow_html=True)
 
+VERSION = "2.0"
 PRESETS = {
-    "Actions": {"Apple": "AAPL", "Nvidia": "NVDA", "Microsoft": "MSFT", "TotalEnergies": "TTE.PA", "Airbus": "AIR.PA"},
-    "Indices": {"Nasdaq 100": "^NDX", "S&P 500": "^GSPC", "CAC 40": "^FCHI", "DAX": "^GDAXI", "Dow Jones": "^DJI"},
-    "Forex": {"EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "JPY=X", "AUD/USD": "AUDUSD=X"},
-    "Crypto": {"Bitcoin": "BTC-USD", "Ethereum": "ETH-USD", "Solana": "SOL-USD"},
-    "Matières premières": {"Or": "GC=F", "Argent": "SI=F", "Pétrole WTI": "CL=F", "Gaz naturel": "NG=F"},
+    "Actions": {"Apple":"AAPL","Nvidia":"NVDA","Microsoft":"MSFT","TotalEnergies":"TTE.PA","Airbus":"AIR.PA"},
+    "Indices": {"Nasdaq 100":"^NDX","S&P 500":"^GSPC","CAC 40":"^FCHI","DAX":"^GDAXI","Dow Jones":"^DJI"},
+    "Forex": {"EUR/USD":"EURUSD=X","GBP/USD":"GBPUSD=X","USD/JPY":"JPY=X","AUD/USD":"AUDUSD=X"},
+    "Crypto": {"Bitcoin":"BTC-USD","Ethereum":"ETH-USD","Solana":"SOL-USD"},
+    "Matières premières": {"Or":"GC=F","Argent":"SI=F","Pétrole WTI":"CL=F","Gaz naturel":"NG=F"},
 }
-
-PERIODS = {
-    "1 jour / 5 min": ("1d", "5m"),
-    "5 jours / 15 min": ("5d", "15m"),
-    "1 mois / 1 heure": ("1mo", "1h"),
-    "3 mois / 1 jour": ("3mo", "1d"),
-    "6 mois / 1 jour": ("6mo", "1d"),
-    "1 an / 1 jour": ("1y", "1d"),
-    "2 ans / 1 jour": ("2y", "1d"),
-    "5 ans / 1 semaine": ("5y", "1wk"),
+TF_CONFIG = {
+    "5 min": ("5d","5m"),
+    "15 min": ("1mo","15m"),
+    "1 heure": ("3mo","1h"),
+    "4 heures": ("6mo","1h"),  # Yahoo ne fournit pas toujours le 4h : resampling depuis le 1h.
+    "Journalier": ("2y","1d"),
+    "Hebdomadaire": ("5y","1wk"),
 }
+TF_ORDER = ["5 min","15 min","1 heure","4 heures","Journalier","Hebdomadaire"]
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_market_data(ticker, period, interval):
-    raw = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
-    if raw is None or raw.empty:
+def fetch_data(ticker, period, interval):
+    try:
+        raw = yf.download(ticker, period=period, interval=interval, auto_adjust=True,
+                          progress=False, threads=False)
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        raw.columns = [str(c).lower().replace(" ","_") for c in raw.columns]
+        cols = ["open","high","low","close","volume"]
+        if not all(c in raw.columns for c in cols):
+            return pd.DataFrame()
+        out = raw[cols].copy().dropna(subset=["open","high","low","close"])
+        out.index = pd.to_datetime(out.index)
+        if getattr(out.index, "tz", None) is not None:
+            out.index = out.index.tz_localize(None)
+        return out
+    except Exception:
         return pd.DataFrame()
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    raw.columns = [str(c).lower().replace(" ", "_") for c in raw.columns]
-    needed = ["open", "high", "low", "close", "volume"]
-    if not all(c in raw.columns for c in needed):
-        return pd.DataFrame()
-    df = raw[needed].copy().dropna(subset=["open", "high", "low", "close"])
-    df.index = pd.to_datetime(df.index)
+
+def get_tf_data(ticker, tf):
+    period, interval = TF_CONFIG[tf]
+    df = fetch_data(ticker, period, interval)
+    if tf == "4 heures" and not df.empty:
+        # Resampling is approximate and depends on Yahoo's hourly timestamps.
+        df = df.resample("4h").agg({
+            "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+        }).dropna(subset=["open","high","low","close"])
     return df
 
-def calculate_indicators(df):
+def indicators(df):
     x = df.copy()
-    close = x["close"]
-    x["sma20"] = close.rolling(20).mean()
-    x["sma50"] = close.rolling(50).mean()
-    x["ema12"] = close.ewm(span=12, adjust=False).mean()
-    x["ema26"] = close.ewm(span=26, adjust=False).mean()
-    x["macd"] = x["ema12"] - x["ema26"]
-    x["macd_signal"] = x["macd"].ewm(span=9, adjust=False).mean()
-    delta = close.diff()
+    c = x.close
+    x["sma20"] = c.rolling(20).mean()
+    x["sma50"] = c.rolling(50).mean()
+    x["sma200"] = c.rolling(200).mean()
+    x["ema12"] = c.ewm(span=12, adjust=False).mean()
+    x["ema26"] = c.ewm(span=26, adjust=False).mean()
+    x["macd"] = x.ema12 - x.ema26
+    x["macd_signal"] = x.macd.ewm(span=9, adjust=False).mean()
+    delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
-    x["rsi"] = 100 - (100 / (1 + rs))
-    mid = close.rolling(20).mean()
-    std = close.rolling(20).std()
-    x["bb_mid"] = mid
-    x["bb_upper"] = mid + 2 * std
-    x["bb_lower"] = mid - 2 * std
-    prev_close = close.shift(1)
-    tr = pd.concat([(x["high"]-x["low"]), (x["high"]-prev_close).abs(), (x["low"]-prev_close).abs()], axis=1).max(axis=1)
-    x["atr"] = tr.rolling(14).mean()
-    typical = (x["high"] + x["low"] + close) / 3
-    vol = x["volume"].fillna(0)
-    cumvol = vol.cumsum().replace(0, np.nan)
-    x["vwap"] = (typical * vol).cumsum() / cumvol
+    x["rsi"] = 100 - 100/(1+rs)
+    prev = c.shift(1)
+    tr = pd.concat([(x.high-x.low),(x.high-prev).abs(),(x.low-prev).abs()],axis=1).max(axis=1)
+    x["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
+    mid = c.rolling(20).mean()
+    sd = c.rolling(20).std()
+    x["bb_mid"], x["bb_upper"], x["bb_lower"] = mid, mid+2*sd, mid-2*sd
+    typical = (x.high+x.low+c)/3
+    vol = x.volume.fillna(0)
+    # Intraday VWAP resets each session; for daily/weekly, cumulative over loaded history.
+    if len(x.index) and (x.index[-1]-x.index[0]).total_seconds() < 90*86400 and x.index[-1].hour != 0:
+        session = pd.Series(x.index.date, index=x.index)
+        pv = typical*vol
+        x["vwap"] = pv.groupby(session).cumsum()/vol.groupby(session).cumsum().replace(0,np.nan)
+    else:
+        x["vwap"] = (typical*vol).cumsum()/vol.cumsum().replace(0,np.nan)
     return x
 
-def pivot_levels(df):
-    last = df.iloc[-1]
-    p = (last["high"] + last["low"] + last["close"]) / 3
-    return {"Pivot": p, "R1": 2*p-last["low"], "S1": 2*p-last["high"],
-            "R2": p+(last["high"]-last["low"]), "S2": p-(last["high"]-last["low"])}
-
-def swing_levels(df, window=3):
-    highs, lows = [], []
-    h, l = df["high"].to_numpy(), df["low"].to_numpy()
-    for i in range(window, len(df)-window):
-        if h[i] == np.max(h[i-window:i+window+1]):
-            highs.append(float(h[i]))
-        if l[i] == np.min(l[i-window:i+window+1]):
-            lows.append(float(l[i]))
-    # Keep nearby distinct levels only
-    def unique_sorted(vals):
-        vals = sorted(vals)
-        out = []
-        for v in vals:
-            if not out or abs(v-out[-1])/max(abs(v), 1e-9) > 0.003:
-                out.append(v)
-        return out
-    return unique_sorted(lows)[-5:], unique_sorted(highs)[:][-5:]
-
-def volume_profile(df, bins=30):
-    typical = (df["high"] + df["low"] + df["close"]) / 3
-    low, high = float(df["low"].min()), float(df["high"].max())
-    if not np.isfinite(low+high) or high <= low:
-        return None
-    edges = np.linspace(low, high, bins+1)
-    idx = np.clip(np.digitize(typical, edges)-1, 0, bins-1)
-    volumes = np.zeros(bins)
-    for i, v in zip(idx, df["volume"].fillna(0).to_numpy()):
-        volumes[i] += max(float(v), 0)
-    centers = (edges[:-1]+edges[1:])/2
-    if volumes.sum() <= 0:
-        return None
-    poc_i = int(np.argmax(volumes))
-    # Approximate 70% value area by expanding from POC to larger adjacent volume
-    selected = {poc_i}
-    target = volumes.sum() * 0.70
-    total = volumes[poc_i]
-    left, right = poc_i-1, poc_i+1
-    while total < target and (left >= 0 or right < bins):
-        lv = volumes[left] if left >= 0 else -1
-        rv = volumes[right] if right < bins else -1
-        if rv > lv:
-            selected.add(right); total += max(rv, 0); right += 1
-        else:
-            selected.add(left); total += max(lv, 0); left -= 1
-    return {"poc": float(centers[poc_i]), "vah": float(centers[max(selected)]),
-            "val": float(centers[min(selected)]), "centers": centers, "volumes": volumes}
-
-def dow_structure(df):
-    lows, highs = swing_levels(df, window=3)
-    # Compare the last two confirmed pivot highs and lows where available.
-    # This is a simplified structural reading, not a full Dow Theory engine.
-    if len(highs) >= 2 and len(lows) >= 2:
-        higher_high = highs[-1] > highs[-2]
-        higher_low = lows[-1] > lows[-2]
-        lower_high = highs[-1] < highs[-2]
-        lower_low = lows[-1] < lows[-2]
-        if higher_high and higher_low:
-            return "Structure haussière (sommets et creux ascendants)"
-        if lower_high and lower_low:
-            return "Structure baissière (sommets et creux descendants)"
-        return "Structure mixte / consolidation"
-    return "Données insuffisantes pour qualifier la structure de Dow"
+def trend_reading(df):
+    if len(df) < 55:
+        return "Données insuffisantes", 0
+    r = df.iloc[-1]
+    if pd.isna(r.sma20) or pd.isna(r.sma50):
+        return "Données insuffisantes", 0
+    score = int(r.sma20 > r.sma50) + int(r.close > r.sma20)
+    score -= int(r.sma20 < r.sma50) + int(r.close < r.sma20)
+    if score >= 2: return "Haussière", score
+    if score <= -2: return "Baissière", score
+    return "Neutre / mixte", score
 
 def candle_patterns(df):
-    if len(df) < 2:
-        return []
-    a, b = df.iloc[-2], df.iloc[-1]
-    body = abs(b.close-b.open)
-    rng = max(b.high-b.low, 1e-12)
-    lower = min(b.open,b.close)-b.low
-    upper = b.high-max(b.open,b.close)
-    found = []
-    if body/rng < 0.10:
-        found.append("Doji")
-    if lower > body*2 and upper < body*0.8 and body/rng < 0.4:
-        found.append("Marteau potentiel")
-    if b.close > b.open and a.close < a.open and b.open <= a.close and b.close >= a.open:
-        found.append("Avalement haussier")
-    if b.close < b.open and a.close > a.open and b.open >= a.close and b.close <= a.open:
-        found.append("Avalement baissier")
-    return found
+    if len(df)<2: return []
+    a,b=df.iloc[-2],df.iloc[-1]
+    body=abs(b.close-b.open); rng=max(b.high-b.low,1e-12)
+    lower=min(b.open,b.close)-b.low; upper=b.high-max(b.open,b.close)
+    out=[]
+    if body/rng<.1: out.append("Doji")
+    if lower>body*2 and upper<body*.8 and body/rng<.4: out.append("Marteau potentiel")
+    if b.close>a.open and b.open<a.close and a.close<a.open and b.close>b.open: out.append("Avalement haussier")
+    if b.close<a.open and b.open>a.close and a.close>a.open and b.close<b.open: out.append("Avalement baissier")
+    return out
 
-def signal_analysis(df):
-    last = df.iloc[-1]
-    score = 0
-    reasons = []
-    if pd.notna(last.sma20) and pd.notna(last.sma50):
-        if last.sma20 > last.sma50:
-            score += 1; reasons.append("SMA 20 au-dessus de SMA 50")
-        else:
-            score -= 1; reasons.append("SMA 20 sous SMA 50")
-    if pd.notna(last.vwap):
-        if last.close > last.vwap:
-            score += 1; reasons.append("Cours au-dessus du VWAP calculé")
-        else:
-            score -= 1; reasons.append("Cours sous le VWAP calculé")
-    if pd.notna(last.macd) and pd.notna(last.macd_signal):
-        if last.macd > last.macd_signal:
-            score += 1; reasons.append("MACD au-dessus de son signal")
-        else:
-            score -= 1; reasons.append("MACD sous son signal")
-    if pd.notna(last.rsi):
-        if 50 <= last.rsi <= 70:
-            score += 1; reasons.append("RSI en zone de momentum haussier")
-        elif 30 <= last.rsi < 50:
-            score -= 1; reasons.append("RSI en zone de momentum faible")
-        elif last.rsi > 70:
-            reasons.append("RSI élevé : risque de surachat")
-        elif last.rsi < 30:
-            reasons.append("RSI bas : possible survente")
-    patterns = candle_patterns(df)
-    if "Avalement haussier" in patterns: score += 1
-    if "Avalement baissier" in patterns: score -= 1
-    label = "Biais haussier" if score >= 2 else "Biais baissier" if score <= -2 else "Neutre / mitigé"
-    return score, label, reasons, patterns
+def pivots(df):
+    pbar = df.iloc[-2] if len(df)>1 else df.iloc[-1]
+    p=(pbar.high+pbar.low+pbar.close)/3
+    span=pbar.high-pbar.low
+    return {"Pivot":p,"R1":2*p-pbar.low,"S1":2*p-pbar.high,"R2":p+span,"S2":p-span}
+
+def swing_levels(df, window=3):
+    highs=[]; lows=[]
+    h=df.high.to_numpy(); l=df.low.to_numpy()
+    for i in range(window,len(df)-window):
+        if h[i] == np.max(h[i-window:i+window+1]): highs.append(float(h[i]))
+        if l[i] == np.min(l[i-window:i+window+1]): lows.append(float(l[i]))
+    def compact(vals):
+        vals=sorted(vals); out=[]
+        for v in vals:
+            if not out or abs(v-out[-1])/max(abs(v),1e-9)>.003: out.append(v)
+        return out[-5:]
+    return compact(lows),compact(highs)
+
+def volume_profile(df, bins=32):
+    if df.empty: return None
+    typical=(df.high+df.low+df.close)/3
+    lo,hi=float(df.low.min()),float(df.high.max())
+    if not np.isfinite(lo+hi) or hi<=lo: return None
+    edges=np.linspace(lo,hi,bins+1)
+    ids=np.clip(np.digitize(typical,edges)-1,0,bins-1)
+    vols=np.zeros(bins)
+    for i,v in zip(ids,df.volume.fillna(0).to_numpy()): vols[i]+=max(float(v),0)
+    if vols.sum()<=0: return None
+    centers=(edges[:-1]+edges[1:])/2
+    poc=int(np.argmax(vols)); chosen={poc}; total=vols[poc]; target=.70*vols.sum()
+    left,right=poc-1,poc+1
+    while total<target and (left>=0 or right<bins):
+        lv=vols[left] if left>=0 else -1
+        rv=vols[right] if right<bins else -1
+        if rv>lv: chosen.add(right); total+=max(rv,0); right+=1
+        else: chosen.add(left); total+=max(lv,0); left-=1
+    return {"poc":float(centers[poc]),"vah":float(centers[max(chosen)]),
+            "val":float(centers[min(chosen)]),"centers":centers,"volumes":vols}
+
+def make_signal(frames):
+    available=[(tf,df) for tf,df in frames.items() if len(df)>=55]
+    if not available: return "ATTENTE", "Historique insuffisant sur les unités sélectionnées.", 0
+    scores=[]
+    for tf,df in available:
+        _,s=trend_reading(df); scores.append((tf,s))
+    total=sum(s for _,s in scores)
+    details=[f"{tf}: {('haussier' if s>0 else 'baissier' if s<0 else 'neutre')} ({s:+d})" for tf,s in scores]
+    # Signal uses majority alignment, but a single lower timeframe cannot overrule the higher ones.
+    higher=[s for tf,s in scores if tf in ("1 heure","4 heures","Journalier","Hebdomadaire")]
+    if not higher: higher=[s for _,s in scores]
+    high=sum(higher)
+    if high>=2 and total>=3: label="ACHAT À ÉTUDIER"
+    elif high<=-2 and total<=-3: label="VENTE À ÉTUDIER"
+    else: label="ATTENTE"
+    return label, "Confluence multi-unités : "+" ; ".join(details), total
+
+def backtest_sma(df, fee_bps=5, slippage_bps=2, mode="Long uniquement"):
+    # Signal at close t is shifted to exposure during t+1: no same-bar look-ahead.
+    x=df.copy()
+    x["fast"]=x.close.rolling(20).mean()
+    x["slow"]=x.close.rolling(50).mean()
+    raw=np.where(x.fast>x.slow,1,0)
+    if mode=="Long / short": raw=np.where(x.fast>x.slow,1,-1)
+    pos=pd.Series(raw,index=x.index).shift(1).fillna(0)
+    asset_ret=x.close.pct_change().fillna(0)
+    turnover=pos.diff().abs().fillna(pos.abs())
+    cost=(fee_bps+slippage_bps)/10000
+    strat_ret=pos*asset_ret-turnover*cost
+    equity=(1+strat_ret).cumprod()
+    peak=equity.cummax()
+    dd=equity/peak-1
+    changes=pos.diff().fillna(pos).abs()
+    trade_entries=int((changes>0).sum())
+    wins=int((strat_ret[changes>0]>0).sum())
+    gross_profit=float(strat_ret[strat_ret>0].sum())
+    gross_loss=float(abs(strat_ret[strat_ret<0].sum()))
+    pf=gross_profit/gross_loss if gross_loss>0 else np.nan
+    return {"equity":equity,"returns":strat_ret,"total_return":float(equity.iloc[-1]-1),
+            "max_dd":float(dd.min()),"win_rate":wins/max(trade_entries,1),
+            "profit_factor":pf,"trades":trade_entries}
 
 st.title("📈 Trading Analyzer Pro")
-st.caption("Plateforme d'analyse technique pédagogique — données gratuites Yahoo Finance")
+st.caption("Version 2.0 • Analyse multi-unités, gestion du risque et backtesting pédagogique • Données gratuites Yahoo Finance")
+
 with st.sidebar:
     st.header("Marché")
-    market = st.selectbox("Catégorie", list(PRESETS.keys()))
-    preset_name = st.selectbox("Instrument", list(PRESETS[market].keys()))
-    default_ticker = PRESETS[market][preset_name]
-    ticker = st.text_input("Ticker Yahoo Finance", value=default_ticker).strip().upper()
-    timeframe = st.selectbox("Période / unité", list(PERIODS.keys()), index=3)
-    period, interval = PERIODS[timeframe]
+    category=st.selectbox("Catégorie",list(PRESETS))
+    instrument=st.selectbox("Instrument",list(PRESETS[category]))
+    ticker=st.text_input("Ticker Yahoo Finance",value=PRESETS[category][instrument]).strip().upper()
     st.divider()
-    st.caption("Exemples de tickers : AAPL, AIR.PA, EURUSD=X, BTC-USD, GC=F.")
-    refresh = st.button("↻ Actualiser les données", use_container_width=True)
-    if refresh:
-        st.cache_data.clear()
+    st.subheader("Unités de temps")
+    selected_tfs=st.multiselect("Unités à comparer",TF_ORDER,default=TF_ORDER)
+    chart_tf=st.selectbox("Unité du graphique principal",selected_tfs or TF_ORDER,index=0)
+    refresh=st.button("↻ Actualiser les données",use_container_width=True)
+    if refresh: st.cache_data.clear()
+    st.caption("Les données intraday gratuites sont limitées. Le 4 h est reconstruit à partir des bougies 1 h.")
 
 if not ticker:
-    st.error("Saisis un ticker valide.")
+    st.error("Saisis un ticker valide."); st.stop()
+if not selected_tfs:
+    st.warning("Sélectionne au moins une unité de temps."); st.stop()
+
+frames={}
+with st.spinner(f"Chargement des unités de temps de {ticker}…"):
+    for tf in selected_tfs:
+        raw=get_tf_data(ticker,tf)
+        if not raw.empty: frames[tf]=indicators(raw)
+
+if chart_tf not in frames:
+    st.error(f"Aucune donnée disponible pour {ticker} en {chart_tf}. Essaie une autre unité ou un autre actif.")
     st.stop()
+if len(frames[chart_tf])<5:
+    st.error("Historique trop court pour afficher l'analyse."); st.stop()
 
-with st.spinner(f"Chargement de {ticker} depuis Yahoo Finance…"):
-    raw = load_market_data(ticker, period, interval)
+df=frames[chart_tf]; last=df.iloc[-1]; prev=df.iloc[-2]
+change=(last.close/prev.close-1)*100 if prev.close else 0
+signal,signal_reason,confluence=make_signal(frames)
+trend,trend_score=trend_reading(df)
+profile=volume_profile(df)
+supports,resistances=swing_levels(df)
+piv=pivots(df)
+patterns=candle_patterns(df)
 
-if raw.empty or len(raw) < 5:
-    st.error("Aucune donnée exploitable reçue. Vérifie le ticker, la période ou réessaie plus tard.")
-    st.info("Les données gratuites peuvent être retardées, limitées ou indisponibles selon l'instrument.")
-    st.stop()
+m1,m2,m3,m4,m5=st.columns(5)
+m1.metric("Dernier cours",f"{last.close:,.4f}",f"{change:+.2f}%")
+m2.metric("RSI (14)",f"{last.rsi:.1f}" if pd.notna(last.rsi) else "—")
+m3.metric("ATR (14)",f"{last.atr:.4f}" if pd.notna(last.atr) else "—")
+m4.metric("Tendance du graphique",trend)
+m5.metric("Confluence multi-unités",f"{confluence:+d}")
 
-df = calculate_indicators(raw)
-last = df.iloc[-1]
-prev = df.iloc[-2]
-change = (last.close / prev.close - 1) * 100 if prev.close else 0
-score, bias, reasons, patterns = signal_analysis(df)
-profile = volume_profile(df)
-supports, resistances = swing_levels(df)
-dow_reading = dow_structure(df)
-pivots = pivot_levels(df)
+if signal=="ACHAT À ÉTUDIER": st.success("Signal indicatif : ACHAT À ÉTUDIER")
+elif signal=="VENTE À ÉTUDIER": st.error("Signal indicatif : VENTE À ÉTUDIER")
+else: st.info("Signal indicatif : ATTENTE")
+st.caption(signal_reason)
 
-m1,m2,m3,m4,m5 = st.columns(5)
-m1.metric("Dernier cours", f"{last.close:,.4f}", f"{change:+.2f}%")
-m2.metric("RSI (14)", f"{last.rsi:.1f}" if pd.notna(last.rsi) else "—")
-m3.metric("ATR (14)", f"{last.atr:.4f}" if pd.notna(last.atr) else "—")
-m4.metric("Biais indicatif", bias)
-m5.metric("Confluence", f"{score:+d}/5")
+tab1,tab2,tab3,tab4,tab5=st.tabs(["📊 Graphique","🧭 Multi-unités & niveaux","🛡️ Gestion du risque","🧪 Backtesting","📓 Journal & méthode"])
 
-tab_chart, tab_analysis, tab_risk, tab_journal, tab_method = st.tabs(
-    ["📊 Graphique", "🧭 Analyse", "🛡️ Gestion du risque", "📓 Journal", "ℹ️ Méthode & limites"]
-)
-
-with tab_chart:
-    overlays = st.multiselect("Afficher sur le graphique", ["SMA 20", "SMA 50", "Bandes de Bollinger", "VWAP"], default=["SMA 20","SMA 50","Bandes de Bollinger"])
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                        row_heights=[0.75,0.25], specs=[[{"secondary_y":False}],[{"secondary_y":False}]])
-    fig.add_trace(go.Candlestick(x=df.index, open=df.open, high=df.high, low=df.low, close=df.close, name="Prix"), row=1,col=1)
-    if "SMA 20" in overlays: fig.add_trace(go.Scatter(x=df.index,y=df.sma20,name="SMA 20",line=dict(width=1.4)),row=1,col=1)
-    if "SMA 50" in overlays: fig.add_trace(go.Scatter(x=df.index,y=df.sma50,name="SMA 50",line=dict(width=1.4)),row=1,col=1)
+with tab1:
+    overlays=st.multiselect("Indicateurs sur le graphique",["SMA 20","SMA 50","SMA 200","Bandes de Bollinger","VWAP"],default=["SMA 20","SMA 50","Bandes de Bollinger"])
+    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=.04,row_heights=[.75,.25])
+    fig.add_trace(go.Candlestick(x=df.index,open=df.open,high=df.high,low=df.low,close=df.close,name="Prix"),row=1,col=1)
+    for name,col in [("SMA 20","sma20"),("SMA 50","sma50"),("SMA 200","sma200"),("VWAP","vwap")]:
+        if name in overlays: fig.add_trace(go.Scatter(x=df.index,y=df[col],name=name,line=dict(width=1.4)),row=1,col=1)
     if "Bandes de Bollinger" in overlays:
         fig.add_trace(go.Scatter(x=df.index,y=df.bb_upper,name="Bollinger haute",line=dict(width=1,dash="dot")),row=1,col=1)
         fig.add_trace(go.Scatter(x=df.index,y=df.bb_lower,name="Bollinger basse",line=dict(width=1,dash="dot"),fill="tonexty",fillcolor="rgba(100,130,180,.08)"),row=1,col=1)
-    if "VWAP" in overlays: fig.add_trace(go.Scatter(x=df.index,y=df.vwap,name="VWAP période chargée",line=dict(width=1.5,dash="dash")),row=1,col=1)
-    fig.add_trace(go.Bar(x=df.index,y=df.volume,name="Volume",marker=dict(opacity=.55)),row=2,col=1)
-    fig.update_layout(height=680, template="plotly_dark", xaxis_rangeslider_visible=False,
-                      margin=dict(l=10,r=10,t=35,b=10), legend=dict(orientation="h"))
-    fig.update_yaxes(title_text="Prix",row=1,col=1)
-    fig.update_yaxes(title_text="Volume",row=2,col=1)
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"{len(df)} bougies chargées • Dernière bougie : {df.index[-1]} • Unité : {interval}")
+    fig.add_trace(go.Bar(x=df.index,y=df.volume,name="Volume",opacity=.55),row=2,col=1)
+    fig.update_layout(height=680,template="plotly_dark",xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=30,b=10),legend=dict(orientation="h"))
+    fig.update_yaxes(title_text="Prix",row=1,col=1); fig.update_yaxes(title_text="Volume",row=2,col=1)
+    st.plotly_chart(fig,use_container_width=True)
+    st.caption(f"{len(df)} bougies • Dernière bougie : {df.index[-1]} • Unité : {chart_tf}")
+    st.write("Figures de la dernière bougie :",", ".join(patterns) if patterns else "Aucune figure simple détectée.")
 
-with tab_analysis:
-    left,right = st.columns([1.1,1])
-    with left:
-        st.subheader("Confluence des indicateurs")
-        st.metric("Lecture indicative", bias, f"Score {score:+d}")
-        for reason in reasons: st.write("•", reason)
-        if patterns:
-            st.write("**Figures détectées sur la dernière bougie :** " + ", ".join(patterns))
-        else:
-            st.write("Aucune figure simple détectée sur la dernière bougie.")
-        st.warning("Ce score est une heuristique, pas une probabilité de gain ni un conseil d'achat/vente.")
-    with right:
-        st.subheader("Théorie de Dow — lecture simplifiée")
-        st.write(dow_reading)
-        st.subheader("Supports et résistances")
-        st.write("**Supports détectés**")
-        st.write(" · ".join(f"{v:,.4f}" for v in supports) if supports else "Pas assez de points de retournement.")
-        st.write("**Résistances détectées**")
-        st.write(" · ".join(f"{v:,.4f}" for v in resistances) if resistances else "Pas assez de points de retournement.")
-    st.divider()
-    st.subheader("Points pivots classiques — dernière bougie chargée")
-    st.dataframe(pd.DataFrame({"Niveau": list(pivots.keys()), "Valeur": list(pivots.values())}).style.format({"Valeur":"{:.4f}"}), hide_index=True, use_container_width=True)
-    st.subheader("Market Profile / Volume Profile (approximation)")
+with tab2:
+    st.subheader("Tableau de bord multi-unités")
+    rows=[]
+    for tf in TF_ORDER:
+        if tf in frames:
+            d=frames[tf]; tr,sc=trend_reading(d); r=d.iloc[-1]
+            rows.append({"Unité":tf,"Tendance":tr,"Score":sc,"RSI":round(float(r.rsi),1) if pd.notna(r.rsi) else None,
+                         "Cours":float(r.close),"SMA20":float(r.sma20) if pd.notna(r.sma20) else None,
+                         "SMA50":float(r.sma50) if pd.notna(r.sma50) else None,"Bougies":len(d)})
+        else: rows.append({"Unité":tf,"Tendance":"Indisponible","Score":None,"RSI":None,"Cours":None,"SMA20":None,"SMA50":None,"Bougies":0})
+    st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+    st.subheader("Supports et résistances — unité du graphique")
+    a,b=st.columns(2)
+    a.write("**Supports**"); a.write(" · ".join(f"{v:,.4f}" for v in supports) if supports else "Insuffisants")
+    b.write("**Résistances**"); b.write(" · ".join(f"{v:,.4f}" for v in resistances) if resistances else "Insuffisantes")
+    st.subheader("Points pivots (calculés avec la bougie précédente)")
+    st.dataframe(pd.DataFrame({"Niveau":list(piv),"Valeur":list(piv.values())}).style.format({"Valeur":"{:.4f}"}),hide_index=True,use_container_width=True)
+    st.subheader("Volume Profile estimatif")
     if profile:
-        p1,p2,p3 = st.columns(3)
-        p1.metric("POC estimé", f"{profile['poc']:,.4f}")
-        p2.metric("VAH estimé", f"{profile['vah']:,.4f}")
-        p3.metric("VAL estimé", f"{profile['val']:,.4f}")
-        vp = go.Figure(go.Bar(x=profile["volumes"], y=profile["centers"], orientation="h"))
-        vp.update_layout(template="plotly_dark", height=350, title="Volume par tranche de prix (approximation)", xaxis_title="Volume", yaxis_title="Prix")
-        st.plotly_chart(vp, use_container_width=True)
-        st.caption("Le volume de chaque bougie est affecté à son prix typique (Haut + Bas + Clôture)/3. Ce n'est pas un profil tick par tick.")
-    else:
-        st.info("Profil de volume indisponible pour ces données.")
+        c1,c2,c3=st.columns(3)
+        c1.metric("POC estimé",f"{profile['poc']:,.4f}"); c2.metric("VAH estimé",f"{profile['vah']:,.4f}"); c3.metric("VAL estimé",f"{profile['val']:,.4f}")
+        vfig=go.Figure(go.Bar(x=profile["volumes"],y=profile["centers"],orientation="h"))
+        vfig.update_layout(template="plotly_dark",height=360,title="Volume par tranche de prix — approximation",xaxis_title="Volume",yaxis_title="Prix")
+        st.plotly_chart(vfig,use_container_width=True)
+        st.caption("Le volume de chaque bougie est affecté à son prix typique. Ce n'est pas un profil tick par tick.")
+    else: st.info("Profil de volume indisponible.")
 
-with tab_risk:
+with tab3:
     st.subheader("Calculateur de position")
-    c1,c2,c3 = st.columns(3)
-    with c1:
-        capital = st.number_input("Capital du compte (€)", min_value=0.0, value=10000.0, step=500.0)
-        risk_pct = st.number_input("Risque par trade (%)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
-    with c2:
-        entry = st.number_input("Prix d'entrée", min_value=0.000001, value=float(last.close), format="%.6f")
-        stop = st.number_input("Stop-loss", min_value=0.000001, value=float(last.close - (last.atr if pd.notna(last.atr) else last.close*0.02)), format="%.6f")
-    with c3:
-        target = st.number_input("Objectif / take-profit", min_value=0.000001, value=float(last.close + (2*(last.atr if pd.notna(last.atr) else last.close*0.02))), format="%.6f")
-        direction = st.selectbox("Sens", ["Achat (long)", "Vente (short)"])
-    risk_cash = capital*risk_pct/100
-    valid = (entry > stop and target > entry) if direction.startswith("Achat") else (stop > entry and target < entry)
+    c1,c2,c3=st.columns(3)
+    capital=c1.number_input("Capital du compte (€)",min_value=0.0,value=10000.0,step=500.0)
+    risk_pct=c1.number_input("Risque par trade (%)",min_value=.1,max_value=10.0,value=1.0,step=.1)
+    direction=c1.selectbox("Sens",["Achat (long)","Vente (short)"])
+    entry=c2.number_input("Prix d'entrée",min_value=.000001,value=float(last.close),format="%.6f")
+    atr=float(last.atr) if pd.notna(last.atr) else max(float(last.close)*.02,.000001)
+    default_stop=entry-1.5*atr if direction.startswith("Achat") else entry+1.5*atr
+    stop=c2.number_input("Stop-loss",min_value=.000001,value=float(max(default_stop,.000001)),format="%.6f")
+    target=c3.number_input("Objectif",min_value=.000001,value=float(max(entry+3*atr if direction.startswith("Achat") else entry-3*atr,.000001)),format="%.6f")
+    fee=c3.number_input("Frais estimés aller-retour (%)",min_value=0.0,max_value=5.0,value=.10,step=.05)
+    valid=(entry>stop and target>entry) if direction.startswith("Achat") else (stop>entry and target<entry)
     if valid:
-        distance = abs(entry-stop)
-        qty = risk_cash/distance if distance else 0
-        potential = abs(target-entry)*qty
-        rr = abs(target-entry)/distance if distance else 0
-        r1,r2,r3 = st.columns(3)
-        r1.metric("Risque monétaire", f"{risk_cash:,.2f} €")
-        r2.metric("Quantité théorique", f"{qty:,.4f}")
-        r3.metric("Ratio rendement / risque", f"1 : {rr:.2f}")
-        st.write(f"Gain théorique à l'objectif, hors frais : **{potential:,.2f} €**")
-    else:
-        st.error("Niveaux incohérents avec le sens choisi. Vérifie entrée, stop et objectif.")
-    st.caption("Calcul simplifié : il ne tient pas compte des frais, du spread, du slippage, des tailles de contrat, de l'effet de levier ni du risque de change. Vérifie les spécifications de ton courtier.")
+        risk_cash=capital*risk_pct/100; distance=abs(entry-stop)
+        qty=risk_cash/distance if distance else 0
+        rr=abs(target-entry)/distance if distance else 0
+        gross=abs(target-entry)*qty; net=gross-capital*fee/100
+        x1,x2,x3,x4=st.columns(4)
+        x1.metric("Budget de risque",f"{risk_cash:,.2f} €")
+        x2.metric("Quantité théorique",f"{qty:,.4f}")
+        x3.metric("Ratio gain/risque",f"1 : {rr:.2f}")
+        x4.metric("Gain estimé après frais saisis",f"{net:,.2f} €")
+        st.caption("Quantité théorique en unités simples. Vérifie les contrats, lots, devises, spread, levier et frais du courtier.")
+    else: st.error("Les niveaux entrée / stop / objectif sont incohérents avec le sens choisi.")
 
-with tab_journal:
+with tab4:
+    st.subheader("Backtesting — croisement SMA 20 / SMA 50")
+    st.warning("Test pédagogique d'une stratégie simple. Ce résultat historique ne prédit pas les performances futures.")
+    bt_tf=st.selectbox("Unité testée",list(frames),index=list(frames).index(chart_tf))
+    bt_mode=st.selectbox("Sens de la stratégie",["Long uniquement","Long / short"])
+    fee_bps=st.number_input("Frais par changement de position (points de base)",min_value=0.0,max_value=100.0,value=5.0,step=1.0)
+    slip_bps=st.number_input("Slippage estimé (points de base)",min_value=0.0,max_value=100.0,value=2.0,step=1.0)
+    btdf=frames[bt_tf]
+    if len(btdf)<60:
+        st.info("Il faut au moins 60 bougies pour un test raisonnable sur cette unité.")
+    else:
+        result=backtest_sma(btdf,fee_bps,slip_bps,bt_mode)
+        q1,q2,q3,q4,q5=st.columns(5)
+        q1.metric("Performance cumulée",f"{result['total_return']*100:+.2f}%")
+        q2.metric("Drawdown maximal",f"{result['max_dd']*100:.2f}%")
+        q3.metric("Trades / changements",str(result["trades"]))
+        q4.metric("Taux de périodes gagnantes",f"{result['win_rate']*100:.1f}%")
+        q5.metric("Profit factor",f"{result['profit_factor']:.2f}" if np.isfinite(result["profit_factor"]) else "—")
+        eqfig=go.Figure(go.Scatter(x=result["equity"].index,y=result["equity"],name="Capital théorique"))
+        eqfig.update_layout(template="plotly_dark",height=380,title="Courbe de capital normalisée (départ = 1)")
+        st.plotly_chart(eqfig,use_container_width=True)
+        st.caption("Le taux affiché porte sur les changements de position détectés, pas sur un registre exhaustif de trades exécutés. Pas de spread réel ni de fiscalité.")
+        st.download_button("Exporter les résultats du test (CSV)",
+            pd.DataFrame({"Date":result["equity"].index,"Capital_normalise":result["equity"].values,"Rendement_strategie":result["returns"].values}).to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"backtest_{ticker}_{bt_tf.replace(' ','_')}.csv",mime="text/csv")
+
+with tab5:
     st.subheader("Journal de trading")
-    st.caption("Les entrées sont conservées dans la session du navigateur. Télécharge régulièrement le CSV pour garder une copie.")
-    if "trades" not in st.session_state:
-        st.session_state.trades = pd.DataFrame(columns=["Date","Instrument","Sens","Entrée","Sortie","Résultat (€)","Respect du plan","Commentaire"])
-    with st.form("trade_form", clear_on_submit=True):
-        a,b,c = st.columns(3)
-        trade_date = a.date_input("Date", value=datetime.now().date())
-        trade_symbol = b.text_input("Instrument", value=ticker)
-        trade_side = c.selectbox("Sens", ["Long","Short"])
-        d,e,f = st.columns(3)
-        trade_entry = d.number_input("Entrée", min_value=0.0, value=float(last.close))
-        trade_exit = e.number_input("Sortie", min_value=0.0, value=float(last.close))
-        trade_result = f.number_input("Résultat (€)", value=0.0, step=1.0)
-        plan = st.selectbox("Plan respecté ?", ["Oui","Non","Partiellement"])
-        comment = st.text_input("Commentaire / émotion / erreur")
-        submitted = st.form_submit_button("Ajouter au journal")
-        if submitted:
-            new = pd.DataFrame([{"Date":str(trade_date),"Instrument":trade_symbol,"Sens":trade_side,"Entrée":trade_entry,"Sortie":trade_exit,"Résultat (€)":trade_result,"Respect du plan":plan,"Commentaire":comment}])
-            st.session_state.trades = pd.concat([st.session_state.trades,new],ignore_index=True)
-    trades = st.session_state.trades
-    if not trades.empty:
-        st.dataframe(trades, use_container_width=True, hide_index=True)
-        st.metric("Résultat cumulé enregistré", f"{pd.to_numeric(trades['Résultat (€)']).sum():,.2f} €")
-        st.download_button("Télécharger mon journal (CSV)", trades.to_csv(index=False).encode("utf-8-sig"), file_name="journal_trading.csv", mime="text/csv")
-    else:
-        st.info("Ton journal est vide. Ajoute ton premier trade après l'avoir clôturé.")
-
-with tab_method:
-    st.subheader("Sources et limites")
+    st.caption("Le journal est conservé dans la session en cours. Exporte régulièrement le CSV.")
+    if "trades_v2" not in st.session_state:
+        st.session_state.trades_v2=pd.DataFrame(columns=["Date","Ticker","Unité","Sens","Entrée","Sortie","Résultat €","Plan respecté","Émotion / commentaire"])
+    with st.form("trade_form_v2",clear_on_submit=True):
+        a,b,c=st.columns(3)
+        date=a.date_input("Date",value=datetime.now().date())
+        symbol=b.text_input("Instrument",value=ticker)
+        tf=c.selectbox("Unité",TF_ORDER,index=TF_ORDER.index(chart_tf))
+        d,e,f=st.columns(3)
+        side=d.selectbox("Sens",["Long","Short"])
+        ent=e.number_input("Entrée",min_value=0.0,value=float(last.close))
+        out=f.number_input("Sortie",min_value=0.0,value=float(last.close))
+        pnl=d.number_input("Résultat (€)",value=0.0,step=1.0)
+        plan=st.selectbox("Plan respecté ?",["Oui","Non","Partiellement"])
+        note=st.text_input("Émotion / erreur / commentaire")
+        add=st.form_submit_button("Ajouter au journal")
+        if add:
+            new=pd.DataFrame([{"Date":str(date),"Ticker":symbol,"Unité":tf,"Sens":side,"Entrée":ent,"Sortie":out,"Résultat €":pnl,"Plan respecté":plan,"Émotion / commentaire":note}])
+            st.session_state.trades_v2=pd.concat([st.session_state.trades_v2,new],ignore_index=True)
+    if not st.session_state.trades_v2.empty:
+        st.dataframe(st.session_state.trades_v2,use_container_width=True,hide_index=True)
+        st.metric("Résultat cumulé",f"{pd.to_numeric(st.session_state.trades_v2['Résultat €']).sum():,.2f} €")
+        st.download_button("Télécharger mon journal CSV",st.session_state.trades_v2.to_csv(index=False).encode("utf-8-sig"),"journal_trading_v2.csv","text/csv")
+    st.divider()
+    st.subheader("Méthode et limites")
     st.markdown("""
-    - **Données** : Yahoo Finance via la bibliothèque yfinance. Ce service gratuit n'est pas une API de trading garantie ; couverture, délais, historique et disponibilité varient.
-    - **VWAP** : calcul cumulatif sur la période téléchargée. Pour l'intraday, il n'est pas réinitialisé automatiquement à chaque séance dans cette V1.
-    - **POC / VAH / VAL** : estimation à partir du volume agrégé par bougie et de son prix typique, pas un vrai profil basé sur les transactions individuelles.
-    - **Supports / résistances** : pivots locaux calculés sur une fenêtre glissante ; niveaux indicatifs.
-    - **Dow** : la lecture de tendance est simplifiée via SMA et pivots ; ce n'est pas une analyse complète de la théorie de Dow.
-    - **Signaux** : score de confluence heuristique, sans validation statistique ni backtest.
-    - **Scalping** : les intervalles intraday peuvent être limités par Yahoo Finance ; latence et qualité des données inadaptées à une exécution rapide.
-    - **Journal** : données en session, non garanties persistantes sur un hébergement gratuit. Export CSV recommandé.
-    """)
-    st.info("Cette plateforme est un outil pédagogique d'analyse. Elle ne passe aucun ordre et ne garantit aucun résultat financier.")
-    st.write("Version : 1.0 — construit pour une première mise en ligne gratuite.")
+- Données : Yahoo Finance via yfinance. Couverture, délais et historiques varient selon les actifs et unités.
+- 4 heures : agrégation locale de bougies 1 heure ; les limites de séance et horodatages peuvent affecter les regroupements.
+- VWAP : réinitialisation journalière approximative en intraday ; calcul cumulatif sur l'historique pour les unités supérieures.
+- Volume Profile : estimation par prix typique de chaque bougie, pas données transaction par transaction.
+- Signaux : règles heuristiques de tendance multi-unités, sans probabilité de réussite validée.
+- Backtesting : SMA20/SMA50 avec signal décalé d'une bougie et coûts paramétrables. Pas encore de validation walk-forward, de contrôle de sur-optimisation ni de simulation précise des contrats.
+- Journal : session temporaire ; export CSV indispensable pour conserver les données.
+- Aucun ordre n'est transmis à un courtier.
+""")
+    st.info("Outil pédagogique. Ne constitue pas un conseil financier et ne garantit aucun résultat.")
+    st.caption(f"Trading Analyzer Pro — version {VERSION}")
