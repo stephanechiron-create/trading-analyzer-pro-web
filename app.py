@@ -15,7 +15,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-VERSION = "2.0"
+VERSION = "3.0"
 PRESETS = {
     "Actions": {"Apple":"AAPL","Nvidia":"NVDA","Microsoft":"MSFT","TotalEnergies":"TTE.PA","Airbus":"AIR.PA"},
     "Indices": {"Nasdaq 100":"^NDX","S&P 500":"^GSPC","CAC 40":"^FCHI","DAX":"^GDAXI","Dow Jones":"^DJI"},
@@ -202,8 +202,118 @@ def backtest_sma(df, fee_bps=5, slippage_bps=2, mode="Long uniquement"):
             "max_dd":float(dd.min()),"win_rate":wins/max(trade_entries,1),
             "profit_factor":pf,"trades":trade_entries}
 
+
+# Univers de surveillance multi-marchés. Liste volontairement limitée et modifiable.
+SCAN_UNIVERSE = {
+    "Actions": {
+        "Apple": "AAPL", "Nvidia": "NVDA", "Microsoft": "MSFT",
+        "Amazon": "AMZN", "Alphabet": "GOOGL", "Meta": "META",
+        "Airbus": "AIR.PA", "TotalEnergies": "TTE.PA",
+        "LVMH": "MC.PA", "Sanofi": "SAN.PA"
+    },
+    "Indices": {
+        "Nasdaq 100": "^NDX", "S&P 500": "^GSPC", "CAC 40": "^FCHI",
+        "DAX": "^GDAXI", "Dow Jones": "^DJI", "Euro Stoxx 50": "^STOXX50E"
+    },
+    "Forex": {
+        "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X",
+        "USD/JPY": "JPY=X", "AUD/USD": "AUDUSD=X",
+        "USD/CHF": "CHF=X", "USD/CAD": "CAD=X"
+    },
+    "Cryptomonnaies": {
+        "Bitcoin": "BTC-USD", "Ethereum": "ETH-USD",
+        "Solana": "SOL-USD", "XRP": "XRP-USD",
+        "BNB": "BNB-USD", "Dogecoin": "DOGE-USD"
+    },
+    "Matières premières": {
+        "Or": "GC=F", "Argent": "SI=F", "Pétrole WTI": "CL=F",
+        "Gaz naturel": "NG=F", "Cuivre": "HG=F", "Platine": "PL=F"
+    }
+}
+
+def scan_one_asset(name, symbol, tf_list):
+    """Analyse technique indicative d'un actif sur les unités choisies."""
+    rows = []
+    usable = []
+    for tf in tf_list:
+        raw = get_tf_data(symbol, tf)
+        if raw.empty or len(raw) < 55:
+            continue
+        d = indicators(raw)
+        r = d.iloc[-1]
+        prev = d.iloc[-2]
+        trend, tscore = trend_reading(d)
+        close = float(r.close)
+        atr = float(r.atr) if pd.notna(r.atr) else np.nan
+        rsi = float(r.rsi) if pd.notna(r.rsi) else np.nan
+        macd_bull = bool(pd.notna(r.macd) and pd.notna(r.macd_signal) and r.macd > r.macd_signal)
+        vol_mean = d.volume.rolling(20).mean().iloc[-1]
+        vol_ratio = float(r.volume / vol_mean) if pd.notna(vol_mean) and vol_mean > 0 else np.nan
+        above_vwap = bool(pd.notna(r.vwap) and close > float(r.vwap))
+        bb_width = ((float(r.bb_upper-r.bb_lower)/close)*100
+                    if pd.notna(r.bb_upper) and pd.notna(r.bb_lower) and close else np.nan)
+        bb_width_median = ((d.bb_upper-d.bb_lower)/d.close.replace(0,np.nan)).rolling(60).median().iloc[-1]
+        squeeze = bool(pd.notna(bb_width_median) and pd.notna(r.bb_upper) and
+                       ((r.bb_upper-r.bb_lower)/close) <= bb_width_median)
+        recent_high = float(d.high.iloc[-21:-1].max()) if len(d) >= 22 else float(d.high.iloc[:-1].max())
+        recent_low = float(d.low.iloc[-21:-1].min()) if len(d) >= 22 else float(d.low.iloc[:-1].min())
+        breakout_up = close > recent_high
+        breakout_down = close < recent_low
+
+        score = 0
+        score += 20 if tscore == 2 else 10 if tscore == 1 else -15 if tscore == -2 else -7 if tscore == -1 else 0
+        score += 10 if macd_bull else -5
+        score += 10 if above_vwap else -5
+        score += 10 if 45 <= rsi <= 65 else 5 if 35 <= rsi < 45 or 65 < rsi <= 70 else -8 if rsi > 75 or rsi < 25 else 0
+        score += 15 if breakout_up else -10 if breakout_down else 0
+        score += 10 if pd.notna(vol_ratio) and vol_ratio >= 1.5 else 0
+        score += 8 if squeeze else 0
+        score = max(0, min(100, score + 25))
+        if breakout_up and macd_bull:
+            setup = "Cassure haussière à confirmer"
+        elif breakout_down:
+            setup = "Rupture baissière à confirmer"
+        elif squeeze:
+            setup = "Compression — surveiller la sortie"
+        elif trend == "Haussière" and 40 <= rsi <= 62:
+            setup = "Tendance haussière / repli possible"
+        elif trend == "Baissière" and 38 <= rsi <= 60:
+            setup = "Tendance baissière / rebond à risque"
+        elif rsi >= 72:
+            setup = "Surachat — éviter de poursuivre"
+        elif rsi <= 28:
+            setup = "Survente — retournement non confirmé"
+        else:
+            setup = "Configuration neutre"
+        direction = "Long" if score >= 60 else "Short" if score <= 30 else "À attendre"
+        # Niveaux indicatifs calculés à partir du dernier cours et de l'ATR.
+        if np.isfinite(atr) and atr > 0 and direction == "Long":
+            entry = close
+            stop = close - 1.5 * atr
+            target1 = close + 2 * (entry-stop)
+            target2 = close + 3 * (entry-stop)
+        elif np.isfinite(atr) and atr > 0 and direction == "Short":
+            entry = close
+            stop = close + 1.5 * atr
+            target1 = close - 2 * (stop-entry)
+            target2 = close - 3 * (stop-entry)
+        else:
+            entry = stop = target1 = target2 = np.nan
+        rows.append({
+            "Instrument": name, "Ticker": symbol, "Unité": tf,
+            "Cours": close, "Tendance": trend, "RSI": rsi,
+            "Score technique /100": score, "Configuration": setup,
+            "Orientation": direction, "Volume x moyenne": vol_ratio,
+            "Entrée théorique": entry, "Stop-loss": stop,
+            "Objectif 1 (2R)": target1, "Objectif 2 (3R)": target2,
+            "Ratio cible": "1:2 / 1:3" if direction in ("Long","Short") else "—"
+        })
+        usable.append((tf, score))
+    return rows
+
+
 st.title("📈 Trading Analyzer Pro")
-st.caption("Version 2.0 • Analyse multi-unités, gestion du risque et backtesting pédagogique • Données gratuites Yahoo Finance")
+st.caption("Version 3.0 • Analyse multi-unités, scanner d’opportunités multi-marchés, gestion du risque et backtesting pédagogique • Données Yahoo Finance")
 
 with st.sidebar:
     st.header("Marché")
@@ -256,7 +366,7 @@ elif signal=="VENTE À ÉTUDIER": st.error("Signal indicatif : VENTE À ÉTUDIER
 else: st.info("Signal indicatif : ATTENTE")
 st.caption(signal_reason)
 
-tab1,tab2,tab3,tab4,tab5=st.tabs(["📊 Graphique","🧭 Multi-unités & niveaux","🛡️ Gestion du risque","🧪 Backtesting","📓 Journal & méthode"])
+tab1,tab2,tab3,tab4,tab5,tab6=st.tabs(["📊 Graphique","🧭 Multi-unités & niveaux","🛡️ Gestion du risque","🧪 Backtesting","📓 Journal & méthode","🔎 Opportunités à surveiller"])
 
 with tab1:
     overlays=st.multiselect("Indicateurs sur le graphique",["SMA 20","SMA 50","SMA 200","Bandes de Bollinger","VWAP"],default=["SMA 20","SMA 50","Bandes de Bollinger"])
@@ -386,9 +496,85 @@ with tab5:
 - VWAP : réinitialisation journalière approximative en intraday ; calcul cumulatif sur l'historique pour les unités supérieures.
 - Volume Profile : estimation par prix typique de chaque bougie, pas données transaction par transaction.
 - Signaux : règles heuristiques de tendance multi-unités, sans probabilité de réussite validée.
+- Scanner V3 : univers prédéfini de valeurs liquides, non exhaustif ; disponibilité et qualité des données Yahoo Finance variables. Les scores ne sont pas des probabilités.
+- Plans théoriques du scanner : entrée au dernier cours connu, stop à 1,5 ATR, objectifs à 2R et 3R ; aucune validation d’exécution ou de liquidité.
 - Backtesting : SMA20/SMA50 avec signal décalé d'une bougie et coûts paramétrables. Pas encore de validation walk-forward, de contrôle de sur-optimisation ni de simulation précise des contrats.
 - Journal : session temporaire ; export CSV indispensable pour conserver les données.
 - Aucun ordre n'est transmis à un courtier.
 """)
     st.info("Outil pédagogique. Ne constitue pas un conseil financier et ne garantit aucun résultat.")
     st.caption(f"Trading Analyzer Pro — version {VERSION}")
+
+
+
+with tab6:
+    st.subheader("Scanner multi-marchés — opportunités techniques")
+    st.write("Le scanner passe en revue une sélection d'actifs dans toutes les catégories et classe les configurations selon des règles techniques explicites.")
+    st.warning("Les scores mesurent une confluence de critères, pas une probabilité de gain. Les niveaux sont théoriques et ne sont pas des ordres à transmettre.")
+    c1, c2, c3 = st.columns([1.2, 1.2, 1])
+    scan_categories = c1.multiselect(
+        "Marchés à analyser", list(SCAN_UNIVERSE.keys()),
+        default=list(SCAN_UNIVERSE.keys())
+    )
+    scan_tfs = c2.multiselect(
+        "Unités à scanner", TF_ORDER,
+        default=["1 heure", "4 heures", "Journalier", "Hebdomadaire"]
+    )
+    min_score = c3.slider("Score minimum", 0, 100, 55, 5)
+    st.caption("Pour limiter les appels de données, commence avec 1 h, 4 h, journalier et hebdomadaire. Le scan des 6 unités est possible mais plus lent.")
+    run_scan = st.button("🔍 Lancer le scan de marché", type="primary", use_container_width=True)
+    if run_scan:
+        if not scan_categories or not scan_tfs:
+            st.error("Choisis au moins un marché et une unité de temps.")
+        else:
+            scan_rows = []
+            assets = [(cat, nm, sym) for cat in scan_categories
+                      for nm, sym in SCAN_UNIVERSE[cat].items()]
+            progress = st.progress(0, text="Préparation du scan…")
+            for idx, (cat, nm, sym) in enumerate(assets, start=1):
+                try:
+                    found = scan_one_asset(nm, sym, scan_tfs)
+                    for row in found:
+                        row["Marché"] = cat
+                        scan_rows.append(row)
+                except Exception:
+                    pass
+                progress.progress(idx / max(len(assets), 1),
+                                  text=f"Analyse de {nm} ({idx}/{len(assets)})")
+            progress.empty()
+            st.session_state["scan_v3_rows"] = scan_rows
+            st.session_state["scan_v3_time"] = datetime.now().strftime("%d/%m/%Y à %H:%M")
+    if "scan_v3_rows" in st.session_state:
+        scan_df = pd.DataFrame(st.session_state["scan_v3_rows"])
+        if scan_df.empty:
+            st.info("Aucune donnée exploitable n'a été récupérée. Réessaie plus tard ou réduis le nombre d'unités.")
+        else:
+            scan_df = scan_df[scan_df["Score technique /100"] >= min_score].copy()
+            scan_df = scan_df.sort_values(["Score technique /100", "Unité"], ascending=[False, True])
+            st.caption(f"Dernier scan : {st.session_state.get('scan_v3_time','—')} • {len(scan_df)} configurations au-dessus du seuil.")
+            if scan_df.empty:
+                st.info("Aucune configuration ne dépasse le score minimum choisi. C'est aussi un résultat utile : ne pas trader est une décision.")
+            else:
+                st.dataframe(
+                    scan_df[["Marché","Instrument","Ticker","Unité","Cours","Tendance",
+                             "Score technique /100","RSI","Configuration","Orientation"]],
+                    hide_index=True, use_container_width=True,
+                    column_config={
+                        "Cours": st.column_config.NumberColumn(format="%.5f"),
+                        "RSI": st.column_config.NumberColumn(format="%.1f"),
+                        "Score technique /100": st.column_config.ProgressColumn(min_value=0,max_value=100,format="%d")
+                    }
+                )
+                st.subheader("Plan théorique des configurations les mieux classées")
+                top = scan_df.head(10)
+                st.dataframe(
+                    top[["Marché","Instrument","Unité","Orientation","Configuration",
+                         "Entrée théorique","Stop-loss","Objectif 1 (2R)","Objectif 2 (3R)","Ratio cible"]],
+                    hide_index=True, use_container_width=True
+                )
+                csv = scan_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button("Télécharger les résultats du scan (CSV)", csv,
+                                   file_name="trading_analyzer_scan.csv", mime="text/csv")
+            st.caption("Un signal est à examiner sur le graphique avant toute décision. Les niveaux sont basés sur l'ATR (stop à 1,5 ATR, objectifs à 2R et 3R) et ne tiennent pas compte du spread, des frais, du slippage, du levier ou des spécificités de contrat.")
+    else:
+        st.info("Clique sur « Lancer le scan de marché » pour rechercher des configurations dans les différentes catégories.")
